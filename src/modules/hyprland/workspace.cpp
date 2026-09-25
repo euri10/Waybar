@@ -251,8 +251,8 @@ void Workspace::setActiveWindow(WindowAddress const& addr) {
   }
 
   auto activeWindowPos = m_workspaceManager.activeWindowPosition();
-  const bool has_active_window =
-      activeIdx.has_value() && activeWindowPos != Workspaces::ActiveWindowPosition::NONE;
+  const bool has_active_window = m_workspaceManager.enableTaskbar() && activeIdx.has_value() &&
+                                 activeWindowPos != Workspaces::ActiveWindowPosition::NONE;
 
   if (has_active_window) {
     auto window = std::move(m_windowMap[*activeIdx]);
@@ -432,11 +432,31 @@ void Workspace::update(const std::string& workspace_icon, const std::string& wor
   }
 
   std::string windows;
+  std::string plainWindows;
+  const auto& formatWindowActive = m_workspaceManager.formatWindowActive();
   // Optimization: The {windows} substitution string is only possible if the taskbar is disabled, no
   // need to compute this if enableTaskbar() is true
   if (!m_workspaceManager.enableTaskbar()) {
     auto windowSeparator = m_workspaceManager.getWindowSeparator();
     auto groupThreshold = m_workspaceManager.windowRewriteGroupThreshold();
+
+    auto appendSeparator = [&] {
+      windows.append(windowSeparator);
+      if (!formatWindowActive.empty()) plainWindows.append(windowSeparator);
+    };
+    auto appendWindow = [&](const std::string& representation, bool isActive) {
+      if (!formatWindowActive.empty()) plainWindows.append(representation);
+      if (isActive && !formatWindowActive.empty()) {
+        try {
+          windows.append(fmt::format(fmt::runtime(formatWindowActive), representation));
+        } catch (const fmt::format_error& e) {
+          spdlog::warn("Formatting format-window-active error: {}", e.what());
+          windows.append(representation);
+        }
+      } else {
+        windows.append(representation);
+      }
+    };
 
     auto end_it = (m_workspaceManager.maxWindows() <= 0 ||
                    static_cast<size_t>(m_workspaceManager.maxWindows()) >= m_windowMap.size())
@@ -445,37 +465,44 @@ void Workspace::update(const std::string& workspace_icon, const std::string& wor
 
     if (groupThreshold > 0) {
       // Build ordered counts of each unique icon (including singular ones when threshold set to 1)
-      std::vector<std::pair<std::string, int>> iconCounts;
+      struct IconCount {
+        std::string icon;
+        int count;
+        int activeIndex;
+      };
+      std::vector<IconCount> iconCounts;
       for (auto it = m_windowMap.begin(); it != end_it; ++it) {
         const auto& window_repr = *it;
         auto found = std::ranges::find_if(
-            iconCounts, [&](const auto& p) { return p.first == window_repr.repr_rewrite; });
+            iconCounts, [&](const auto& item) { return item.icon == window_repr.repr_rewrite; });
         if (found != iconCounts.end()) {
-          found->second++;
+          if (window_repr.isActive) found->activeIndex = found->count;
+          ++found->count;
         } else {
-          iconCounts.emplace_back(window_repr.repr_rewrite, 1);
+          iconCounts.push_back({window_repr.repr_rewrite, 1, window_repr.isActive ? 0 : -1});
         }
       }
 
       // Format the group string
       auto groupFormat = m_workspaceManager.getWindowRewriteGroupFormat();
       bool isNotFirst = false;
-      for (const auto& [icon, count] : iconCounts) {
-        if (count >= groupThreshold) {
-          if (isNotFirst) windows.append(windowSeparator);
+      for (const auto& item : iconCounts) {
+        if (item.count >= groupThreshold) {
+          if (isNotFirst) appendSeparator();
           isNotFirst = true;
           try {
-            windows.append(fmt::format(fmt::runtime(groupFormat), fmt::arg("icon", icon),
-                                       fmt::arg("count", count)));
+            appendWindow(fmt::format(fmt::runtime(groupFormat), fmt::arg("icon", item.icon),
+                                     fmt::arg("count", item.count)),
+                         item.activeIndex >= 0);
           } catch (const fmt::format_error& e) {
             spdlog::warn("Formatting window-rewrite-group-format error: {}", e.what());
-            windows.append(icon);
+            appendWindow(item.icon, item.activeIndex >= 0);
           }
         } else {
-          for (int i = 0; i < count; ++i) {
-            if (isNotFirst) windows.append(windowSeparator);
+          for (int i = 0; i < item.count; ++i) {
+            if (isNotFirst) appendSeparator();
             isNotFirst = true;
-            windows.append(icon);
+            appendWindow(item.icon, i == item.activeIndex);
           }
         }
       }
@@ -483,9 +510,9 @@ void Workspace::update(const std::string& workspace_icon, const std::string& wor
       // Not grouping icons
       bool isNotFirst = false;
       for (auto it = m_windowMap.begin(); it != end_it; ++it) {
-        if (isNotFirst) windows.append(windowSeparator);
+        if (isNotFirst) appendSeparator();
         isNotFirst = true;
-        windows.append(it->repr_rewrite);
+        appendWindow(it->repr_rewrite, it->isActive);
       }
     }
   }
@@ -493,7 +520,8 @@ void Workspace::update(const std::string& workspace_icon, const std::string& wor
   if (!workspace_tooltip.empty()) {
     m_button.set_tooltip_text(
         fmt::format(fmt::runtime(workspace_tooltip), fmt::arg("id", id()), fmt::arg("name", name()),
-                    fmt::arg("icon", workspace_icon), fmt::arg("windows", windows)));
+                    fmt::arg("icon", workspace_icon),
+                    fmt::arg("windows", formatWindowActive.empty() ? windows : plainWindows)));
   }
 
   auto formatBefore = m_workspaceManager.formatBefore();
